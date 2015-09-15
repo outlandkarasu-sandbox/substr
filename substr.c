@@ -38,6 +38,35 @@ size_t Array_findFirstBit(Array *a, size_t i);
 #define Array_get(a, i) (((char *)((a)->p))[(i)])
 #define Array_set(a, i, c) (((char *)((a)->p))[(i)]=(c))
 
+/** ハッシュテーブルの要素の型  */
+typedef struct HashEntry {
+    /** 次の要素 */
+    struct HashEntry *next;
+
+    /** 文字列の始点 */
+    const char *p;
+
+    /** 文字列の長さ */
+    size_t length;
+} HashEntry;
+
+/** ハッシュテーブル */
+typedef struct Hash {
+    /** 要素のルート配列 */
+    HashEntry **entries;
+
+    /** ルート配列のサイズ */
+    size_t factor;
+
+    /** ハッシュテーブルのサイズ */
+    size_t length;
+} Hash;
+
+Result Hash_initialize(Hash *hash, size_t factor);
+Result Hash_putIfAbsent(Hash *hash, const char *p, size_t length, const HashEntry **e);
+size_t Hash_hashFunction(const char *p, size_t length);
+Result Hash_free(Hash *hash);
+
 Result readSource(Array *dest, FILE *file);
 Result scanSameSubstrings(const Array *source, Array *curBits, const Array *oldBits, size_t len);
 
@@ -55,6 +84,7 @@ int main(int argc, const char * const *argv)
     int result = EXIT_SUCCESS;
     size_t len = 0;
     size_t i = 0;
+    size_t j = 0;
 
     /* 入力ファイルを読み込む */
     if(readSource(&source, stdin) != R_OK) {
@@ -102,7 +132,6 @@ int main(int argc, const char * const *argv)
     i = Array_findFirstBit(oldBits, 0);
 
     /* 最初の重複位置の部分文字列と同じ部分文字列を探す */
-    size_t j;
     for(j = i + 1; j < oldBits->length; ++j) {
         j = Array_findFirstBit(oldBits, j);
         if(memcmp(Array_pointer(&source, i), Array_pointer(&source, j), len) == 0) {
@@ -165,36 +194,45 @@ Result readSource(Array *dest, FILE *file)
  */
 Result scanSameSubstrings(const Array *source, Array *dest, const Array *oldBits, size_t len)
 {
+    Hash hash = {0};
     size_t slen = source->length - len + 1;
     size_t i = 0;
     size_t j = 0;
     int found = 0;
+    Result result = R_NG;
 
+    Hash_initialize(&hash, 1024);
+
+    /* 指定サイズの全部分文字列について、ハッシュを使用して重複しているものを洗い出す */
     for(i = 0; i < (slen - 1); ++i) {
-        const void * const sp = Array_pointer(source, i);
+        const char *p;
+        const HashEntry *before = NULL;
 
-        /* すでにセット済みであればスキップ */
-        if(Array_get(dest, i)) {
+        /* 前回検査時の重複文字列の位置でなければスキップ */
+        if(!Array_get(oldBits, i)) {
             continue;
         }
 
-        /* 後続の同一部分文字列を探す */
-        for(j = i + 1; j < slen; ++j) {
-            /* すでにセット済みであればスキップ */
-            if(Array_get(dest, j)) {
-                continue;
-            }
+        /* 現在位置の部分文字列が重複しているか検査する。未登録であればハッシュに登録する */
+        p = Array_pointer(source, i);
+        if(Hash_putIfAbsent(&hash, p, len, &before) != R_OK) {
+            result = R_NG;
+            goto Lerror;
+        }
 
-            /* 現在位置の部分文字列と一致した場合はセット */
-            if(memcmp(sp, Array_pointer(source, j), len) == 0) {
-                /* printf("same %ld == %ld %ld\n", i, j, len); */
-                found = 1;
-                Array_set(dest, i, 1);
-                Array_set(dest, j, 1);
-            }
+        /* 重複している部分文字列だった場合、以前と今回の出現箇所のビットを立てる */
+        if(before) {
+            Array_set(dest, before->p - (const char *)source->p, 1);
+            Array_set(dest, i, 1);
+            found = 1;
         }
     }
-    return found ? R_OK : R_NOTFOUND;
+
+    result = found ? R_OK : R_NOTFOUND;
+
+Lerror:
+    Hash_free(&hash);
+    return result;
 }
 
 /**
@@ -268,5 +306,139 @@ size_t Array_findFirstBit(Array *a, size_t begin)
         }
     }
     return a->length;
+}
+
+/**
+ * ハッシュテーブルの初期化
+ *
+ * @param hash 初期化対象のハッシュ
+ * @param factor ルート配列サイズ
+ *
+ * @return 初期化に成功すればR_OK
+ */
+Result Hash_initialize(Hash *hash, size_t factor)
+{
+    const size_t rootLen = factor * sizeof(HashEntry*);
+
+    if(!hash) {
+        return R_NG;
+    }
+
+    hash->entries = (HashEntry**) malloc(rootLen);
+    if(!hash->entries) {
+        return R_NG;
+    }
+
+    memset(hash->entries, 0, rootLen);
+    hash->factor = factor;
+    hash->length = 0;
+
+    return R_OK;
+}
+
+/**
+ * 文字列がハッシュに未登録であれば登録する
+ *
+ * @param hash 登録先のハッシュ
+ * @param p 文字列の始点。文字列は実行中変化しないことが前提となっているのに注意
+ * @param length 文字列の長さ
+ * @param e 文字列が登録済みの場合は、登録済みエントリへのアドレスがセットされる
+ *
+ * @return 成功時はR_OK
+ */
+Result Hash_putIfAbsent(Hash *hash, const char *p, size_t length, const HashEntry **e)
+{
+    size_t h;
+    HashEntry *entry;
+    HashEntry **dest;
+
+    if(!hash || !hash->entries || hash->factor == 0 || !p) {
+        return R_NG;
+    }
+
+    /* ハッシュ値の計算 */
+    h = Hash_hashFunction(p, length) % hash->factor;
+
+    /* 同値エントリーを検索する */
+    entry = hash->entries[h];
+    dest = &hash->entries[h];
+    for(; entry; dest = &entry->next, entry = entry->next) {
+        /* 同値エントリーが見つかったら中断 */
+        if(entry->length == length && memcmp(entry->p, p, length) == 0) {
+            break;
+        }
+    }
+
+    if(!entry) {
+        if(!dest) {
+            return R_NG; /* ハッシュテーブルの整合性が崩れている */
+        }
+
+        /* 同値エントリーがなければ新たに追加 */
+        *dest = (HashEntry*) malloc(sizeof(HashEntry));
+        if(!*dest) {
+            return R_NG;
+        }
+
+        (*dest)->next = NULL;
+        (*dest)->p = p;
+        (*dest)->length = length;
+        ++hash->length;
+    } else if(e) {
+        /* 同値エントリーが見つかれば引数を通して返す */
+        *e = entry;
+    }
+
+    return R_OK;
+}
+
+/**
+ * 文字列のハッシュ値を計算する
+ *
+ * @param p 文字列の始点
+ * @param length 文字列の長さ
+ *
+ * @return 文字列のハッシュ値
+ */
+size_t Hash_hashFunction(const char *p, size_t length)
+{
+    size_t i;
+    size_t result = 0;
+    for(i = 0; i < length; ++i) {
+        result = result * 31 + p[i];
+    }
+    return 0;
+}
+
+/**
+ * ハッシュテーブルを解放する
+ *
+ * @param hash 解放するハッシュテーブル。解放後は空のハッシュになる
+ */
+Result Hash_free(Hash *hash)
+{
+    size_t i;
+
+    if(!hash) {
+        return R_NG;
+    }
+
+    /* 全エントリの破棄  */
+    for(i = 0; i < hash->factor; ++i) {
+        HashEntry *e;
+        for(e = hash->entries[i]; e;) {
+            HashEntry * const n = e->next;
+            free(e);
+            e = n;
+        }
+    }
+
+    /* ルート配列の破棄 */
+    free(hash->entries);
+    hash->entries = NULL;
+    hash->factor = 0;
+    hash->length = 0;
+
+    return R_OK;
 }
 
