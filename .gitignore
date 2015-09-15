@@ -32,3 +32,5 @@ substr
 
 # Debug files
 *.dSYM/
+
+*.swp

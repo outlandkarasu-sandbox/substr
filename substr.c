@@ -31,6 +31,7 @@ typedef struct Array {
 
 Result Array_resize(Array *a, size_t n);
 Result Array_free(Array *a);
+size_t Array_findFirstBit(Array *a, size_t i);
 
 /** 配列の指定位置のポインタを取得する */
 #define Array_pointer(a, i) ((void *)(&((char *)((a)->p))[(i)]))
@@ -54,7 +55,6 @@ int main(int argc, const char * const *argv)
     int result = EXIT_SUCCESS;
     size_t len = 0;
     size_t i = 0;
-    size_t j = 0;
 
     /* 入力ファイルを読み込む */
     if(readSource(&source, stdin) != R_OK) {
@@ -69,6 +69,7 @@ int main(int argc, const char * const *argv)
         result = EXIT_FAILURE;
         goto Lerror;
     }
+
     if(Array_resize(&bitArray2, bitArray1.length) != R_OK) {
         perror("error at Array_resize(bitArray1)");
         result = EXIT_FAILURE;
@@ -78,6 +79,8 @@ int main(int argc, const char * const *argv)
     /* 最初は全文字位置をチェックするので、以前のビット列は全て1で初期化 */
     memset(oldBits->p, 0xff, oldBits->length);
 
+    /* 長さが入力全体-1までの部分文字列全てについて、重複が見つからなくなるまでループ */
+    /* ループ終了時点で、oldBitsには最長の重複部分文字列が存在する位置が格納されている */
     for(len = 1; len < source.length; ++len) {
         memset(curBits->p, 0x00, curBits->length);
         if(scanSameSubstrings(&source, curBits, oldBits, len) == R_NOTFOUND) {
@@ -95,21 +98,16 @@ int main(int argc, const char * const *argv)
         }
     }
 
-    for(i = 0; i < source.length; ++i) {
-        if(Array_get(oldBits, i)) {
-            break;
-        }
-    }
+    /* 最初の重複位置を探す */
+    i = Array_findFirstBit(oldBits, 0);
 
-    if(i < source.length) {
-        for(j = i + 1; j < source.length; ++j) {
-            if(!Array_get(oldBits, j)) {
-                continue;
-            }
-            if(memcmp(Array_pointer(&source, i), Array_pointer(&source, j), len) == 0) {
-                const char * const cp = (const char *)source.p;
-                printf("length: %ld, %.*s[%ld] == %.*s[%ld]\n", len, (int)len, &cp[i], i, (int)len, &cp[j], j);
-            }
+    /* 最初の重複位置の部分文字列と同じ部分文字列を探す */
+    size_t j;
+    for(j = i + 1; j < oldBits->length; ++j) {
+        j = Array_findFirstBit(oldBits, j);
+        if(memcmp(Array_pointer(&source, i), Array_pointer(&source, j), len) == 0) {
+            const char * const cp = (const char *)source.p;
+            printf("length: %ld, %.*s[%ld] == %.*s[%ld]\n", len, (int)len, &cp[i], i, (int)len, &cp[j], j);
         }
     }
 
@@ -127,7 +125,8 @@ Lerror:
  * @param file 読込元ファイル
  * @return 成功時はR_OK
  */
-Result readSource(Array *dest, FILE *file) {
+Result readSource(Array *dest, FILE *file)
+{
     char buffer[256] = {0};
     size_t i = 0;
 
@@ -239,11 +238,35 @@ Result Array_resize(Array *a, size_t n)
  *
  * @return 成功時はR_OK
  */
-Result Array_free(Array *a) {
+Result Array_free(Array *a)
+{
     if(!a) {
         return R_NG;
     }
     free(a->p);
     return R_OK;
+}
+
+/**
+ * 配列の指定位置から見て先頭に立っているビットの位置を返す
+ *
+ * @param a 立っているビットを探す配列
+ * @param begin ビット探索の開始位置
+ *
+ * @return ビットの立っている位置。見つからなければa->length
+ */
+size_t Array_findFirstBit(Array *a, size_t begin)
+{
+    size_t i;
+    if(!a) {
+        return 0;
+    }
+
+    for(i = begin; i < a->length; ++i) {
+        if(Array_get(a, i)) {
+            return i;
+        }
+    }
+    return a->length;
 }
 
