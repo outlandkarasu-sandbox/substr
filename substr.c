@@ -50,6 +50,15 @@ typedef struct HashEntry {
     size_t length;
 } HashEntry;
 
+/** ハッシュテーブル要素用のキャッシュ*/
+typedef struct HashEntryCache {
+    /** 空き要素のリスト */
+    HashEntry *freeList;
+
+    /** 拡張サイズ */
+    size_t extendSize;
+} HashEntryCache;
+
 /** ハッシュテーブル */
 typedef struct Hash {
     /** 要素のルート配列 */
@@ -60,15 +69,24 @@ typedef struct Hash {
 
     /** ハッシュテーブルのサイズ */
     size_t length;
+
+    /** キャッシュ */
+    HashEntryCache *cache;
 } Hash;
 
-Result Hash_initialize(Hash *hash, size_t factor);
+Result HashEntryCache_initialize(HashEntryCache *cache, size_t exsize);
+Result HashEntryCache_extend(HashEntryCache *cache);
+Result HashEntryCache_allocate(HashEntryCache *cache, HashEntry **dest);
+Result HashEntryCache_deallocate(HashEntryCache *cache, HashEntry *e);
+
+Result Hash_initialize(Hash *hash, size_t factor, HashEntryCache *cache);
 Result Hash_putIfAbsent(Hash *hash, const char *p, size_t length, const HashEntry **e);
 size_t Hash_hashFunction(const char *p, size_t length);
+Result Hash_clear(Hash *hash);
 Result Hash_free(Hash *hash);
 
 Result readSource(Array *dest, FILE *file);
-Result scanSameSubstrings(const Array *source, Array *curBits, const Array *oldBits, size_t len);
+Result scanSameSubstrings(const Array *source, Array *curBits, const Array *oldBits, size_t len, Hash *hash);
 
 /**
  *  @param argc コマンドライン引数の数
@@ -81,6 +99,8 @@ int main(int argc, const char * const *argv)
     Array bitArray2 = {0};
     Array *curBits = &bitArray1;
     Array *oldBits = &bitArray2;
+    HashEntryCache cache = {0};
+    Hash hash = {0};
     int result = EXIT_SUCCESS;
     size_t len = 0;
     size_t i = 0;
@@ -90,6 +110,16 @@ int main(int argc, const char * const *argv)
     if(readSource(&source, stdin) != R_OK) {
         perror("error at readSource");
         result = EXIT_FAILURE;
+        goto Lerror;
+    }
+
+    /* ハッシュを初期化する */
+    if(HashEntryCache_initialize(&cache, 65536) != R_OK) {
+        perror("error at HashEntryCache_initialize");
+        goto Lerror;
+    }
+    if(Hash_initialize(&hash, 65536, &cache) != R_OK) {
+        perror("error at Hash_initialize");
         goto Lerror;
     }
 
@@ -107,13 +137,13 @@ int main(int argc, const char * const *argv)
     }
 
     /* 最初は全文字位置をチェックするので、以前のビット列は全て1で初期化 */
-    memset(oldBits->p, 0xff, oldBits->length);
+    memset(oldBits->p, 0x1, oldBits->length);
 
     /* 長さが入力全体-1までの部分文字列全てについて、重複が見つからなくなるまでループ */
     /* ループ終了時点で、oldBitsには最長の重複部分文字列が存在する位置が格納されている */
     for(len = 1; len < source.length; ++len) {
         memset(curBits->p, 0x00, curBits->length);
-        if(scanSameSubstrings(&source, curBits, oldBits, len) == R_NOTFOUND) {
+        if(scanSameSubstrings(&source, curBits, oldBits, len, &hash) == R_NOTFOUND) {
             --len;
             break;
         }
@@ -189,19 +219,20 @@ Result readSource(Array *dest, FILE *file)
  * @param source 文字列全体
  * @param dest 出力先ビット列
  * @param oldBits 前回検索時のビット列
+ * @param len 部分文字列の長さ
+ * @param hash ハッシュテーブル
  *
  * @return 一致する部分文字列があればR_OK。なければR_NOTFOUND
  */
-Result scanSameSubstrings(const Array *source, Array *dest, const Array *oldBits, size_t len)
+Result scanSameSubstrings(const Array *source, Array *dest, const Array *oldBits, size_t len, Hash *hash)
 {
-    Hash hash = {0};
     size_t slen = source->length - len + 1;
     size_t i = 0;
     size_t j = 0;
     int found = 0;
     Result result = R_NG;
 
-    Hash_initialize(&hash, 1024);
+    Hash_clear(hash);
 
     /* 指定サイズの全部分文字列について、ハッシュを使用して重複しているものを洗い出す */
     for(i = 0; i < (slen - 1); ++i) {
@@ -215,9 +246,8 @@ Result scanSameSubstrings(const Array *source, Array *dest, const Array *oldBits
 
         /* 現在位置の部分文字列が重複しているか検査する。未登録であればハッシュに登録する */
         p = Array_pointer(source, i);
-        if(Hash_putIfAbsent(&hash, p, len, &before) != R_OK) {
-            result = R_NG;
-            goto Lerror;
+        if(Hash_putIfAbsent(hash, p, len, &before) != R_OK) {
+            return R_NG;
         }
 
         /* 重複している部分文字列だった場合、以前と今回の出現箇所のビットを立てる */
@@ -228,11 +258,7 @@ Result scanSameSubstrings(const Array *source, Array *dest, const Array *oldBits
         }
     }
 
-    result = found ? R_OK : R_NOTFOUND;
-
-Lerror:
-    Hash_free(&hash);
-    return result;
+    return found ? R_OK : R_NOTFOUND;
 }
 
 /**
@@ -309,14 +335,110 @@ size_t Array_findFirstBit(Array *a, size_t begin)
 }
 
 /**
+ * キャッシュの初期化
+ * 
+ * @param cache 初期化対象のキャッシュ
+ * @param exsize 拡張サイズ
+ */
+Result HashEntryCache_initialize(HashEntryCache *cache, size_t exsize)
+{
+    if(exsize == 0) {
+        return R_NG;
+    }
+
+    cache->freeList = NULL;
+    cache->extendSize = exsize;
+    return HashEntryCache_extend(cache);
+}
+
+/**
+ * キャッシュを拡張する
+ * 
+ * @param cache 拡張対象のキャッシュ
+ *
+ * @return 成功時はR_OK
+ */
+Result HashEntryCache_extend(HashEntryCache *cache)
+{
+    size_t i;
+
+    if(!cache || cache->freeList != NULL) {
+        return R_NG;
+    }
+
+    /* フリーリストの確保  */
+    cache->freeList = malloc(sizeof(HashEntry) * cache->extendSize);
+    if(!cache->freeList) {
+        return R_NG;
+    }
+
+    /* 確保した全要素を、次の要素を指すよう初期化する。(最後の要素はNULLを指す) */
+    for(i = 0; i < cache->extendSize; ++i) {
+        memset(&cache->freeList[i], 0, sizeof(HashEntry));
+        cache->freeList[i].next = &cache->freeList[i + 1];
+    }
+    cache->freeList[cache->extendSize - 1].next = NULL;
+
+    return R_OK;
+}
+
+/**
+ * 要素をキャッシュから確保する
+ * 
+ * @param cache キャッシュ
+ * @param dest 確保したキャッシュへのポインタの格納先
+ *
+ * @return 成功時はR_OK
+ */
+Result HashEntryCache_allocate(HashEntryCache *cache, HashEntry **dest)
+{
+    if(!cache || !dest) {
+        return R_NG;
+    }
+
+    if(!cache->freeList) {
+        if(HashEntryCache_extend(cache) != R_OK) {
+            return R_NG;
+        }
+    }
+
+    *dest = cache->freeList;
+    cache->freeList = cache->freeList->next;
+    memset(*dest, 0, sizeof(HashEntry));
+
+    return R_OK;
+}
+
+/**
+ * 要素をキャッシュに戻す
+ * 
+ * @param cache キャッシュ
+ * @param e 戻す要素
+ *
+ * @return 成功時はR_OK
+ */
+Result HashEntryCache_deallocate(HashEntryCache *cache, HashEntry *e)
+{
+    if(!cache || !e) {
+        return R_NG;
+    }
+
+    e->next = cache->freeList;
+    cache->freeList = e;
+
+    return R_OK;
+}
+
+/**
  * ハッシュテーブルの初期化
  *
  * @param hash 初期化対象のハッシュ
  * @param factor ルート配列サイズ
+ * @param cache キャッシュ
  *
  * @return 初期化に成功すればR_OK
  */
-Result Hash_initialize(Hash *hash, size_t factor)
+Result Hash_initialize(Hash *hash, size_t factor, HashEntryCache *cache)
 {
     const size_t rootLen = factor * sizeof(HashEntry*);
 
@@ -332,6 +454,7 @@ Result Hash_initialize(Hash *hash, size_t factor)
     memset(hash->entries, 0, rootLen);
     hash->factor = factor;
     hash->length = 0;
+    hash->cache = cache;
 
     return R_OK;
 }
@@ -375,8 +498,7 @@ Result Hash_putIfAbsent(Hash *hash, const char *p, size_t length, const HashEntr
         }
 
         /* 同値エントリーがなければ新たに追加 */
-        *dest = (HashEntry*) malloc(sizeof(HashEntry));
-        if(!*dest) {
+        if(HashEntryCache_allocate(hash->cache, dest) != R_OK) {
             return R_NG;
         }
 
@@ -407,15 +529,17 @@ size_t Hash_hashFunction(const char *p, size_t length)
     for(i = 0; i < length; ++i) {
         result = result * 31 + p[i];
     }
-    return 0;
+    return result;
 }
 
 /**
- * ハッシュテーブルを解放する
+ * ハッシュテーブルの全要素を解放する
  *
- * @param hash 解放するハッシュテーブル。解放後は空のハッシュになる
+ * @param hash 要素を解放するハッシュテーブル。解放後も使用可能
+ *
+ * @return 成功時はR_OK
  */
-Result Hash_free(Hash *hash)
+Result Hash_clear(Hash *hash)
 {
     size_t i;
 
@@ -428,9 +552,32 @@ Result Hash_free(Hash *hash)
         HashEntry *e;
         for(e = hash->entries[i]; e;) {
             HashEntry * const n = e->next;
-            free(e);
+            HashEntryCache_deallocate(hash->cache, e);
             e = n;
         }
+        hash->entries[i] = NULL;
+    }
+
+    return R_OK;
+}
+
+
+/**
+ * ハッシュテーブルを解放する
+ *
+ * @param hash 解放するハッシュテーブル。解放後は使用不能になる。
+ */
+Result Hash_free(Hash *hash)
+{
+    size_t i;
+
+    if(!hash) {
+        return R_NG;
+    }
+
+    /* 全エントリの破棄  */
+    if(Hash_clear(hash) != R_OK) {
+        return R_OK;
     }
 
     /* ルート配列の破棄 */
